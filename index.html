@@ -1,0 +1,641 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const BUFFER_SEC = 30;
+
+function getSupportedMime() {
+  const types = ["video/mp4", "video/webm;codecs=h264", "video/webm;codecs=vp9", "video/webm"];
+  return types.find((t) => {
+    try { return MediaRecorder.isTypeSupported(t); } catch { return false; }
+  }) || "video/webm";
+}
+
+function playClickSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // Sharp mechanical click: short noise burst + low thud
+    const bufSize = ctx.sampleRate * 0.08;
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufSize, 8);
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(1.2, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    src.start();
+
+    // Low thud underneath
+    const osc = ctx.createOscillator();
+    const g2 = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(180, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.1);
+    g2.gain.setValueAtTime(0.8, ctx.currentTime);
+    g2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
+    osc.connect(g2);
+    g2.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.1);
+  } catch {}
+}
+
+export default function PickleReel() {
+  const videoRef = useRef(null);
+  const cameraWrapRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const chunkTimestampsRef = useRef([]);
+  const streamRef = useRef(null);
+  const elapsedTimerRef = useRef(null);
+  const bufferTimerRef = useRef(null);
+  const startingRef = useRef(false);
+
+  // Zoom state
+  const zoomRef = useRef(1);
+  const lastDistRef = useRef(null);
+  const [zoom, setZoom] = useState(1);
+  const MIN_ZOOM = 1, MAX_ZOOM = 4;
+
+  const [recording, setRecording] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [bufferPct, setBufferPct] = useState(0);
+  const [bufferFull, setBufferFull] = useState(false);
+  const [facingMode, setFacingMode] = useState("environment");
+  const [lastBlob, setLastBlob] = useState(null);
+  const [modal, setModal] = useState(null);
+  const [toast, setToast] = useState("");
+  const [toastVisible, setToastVisible] = useState(false);
+  const [clipSize, setClipSize] = useState("");
+  const [capturing, setCapturing] = useState(false); // flash feedback
+
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    setToastVisible(true);
+    setTimeout(() => setToastVisible(false), 3200);
+  }, []);
+
+  const pruneBuffer = useCallback(() => {
+    const cutoff = Date.now() - BUFFER_SEC * 1000;
+    while (chunkTimestampsRef.current.length && chunkTimestampsRef.current[0] < cutoff) {
+      chunksRef.current.shift();
+      chunkTimestampsRef.current.shift();
+    }
+  }, []);
+
+  const clearTimers = () => {
+    clearInterval(elapsedTimerRef.current);
+    clearInterval(bufferTimerRef.current);
+  };
+
+  const stopEverything = useCallback((opts = {}) => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      try { mediaRecorderRef.current.stop(); } catch {}
+    }
+    mediaRecorderRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    clearTimers();
+    chunksRef.current = [];
+    chunkTimestampsRef.current = [];
+    if (!opts.keepState) {
+      setRecording(false);
+      setElapsed(0);
+      setBufferPct(0);
+      setBufferFull(false);
+    }
+    startingRef.current = false;
+  }, []);
+
+  const attachStream = (stream) => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid.srcObject = null;
+    vid.srcObject = stream;
+    vid.onloadedmetadata = () => {
+      vid.play().catch(() => {});
+    };
+    // Fallback: try playing after short delay
+    setTimeout(() => {
+      if (vid.paused) vid.play().catch(() => {});
+    }, 400);
+  };
+
+  const startCamera = useCallback(async (facing) => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    const useFacing = facing ?? facingMode;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: useFacing,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+        audio: true,
+      });
+
+      streamRef.current = stream;
+      attachStream(stream);
+
+      const mime = getSupportedMime();
+      let mr;
+      try {
+        mr = new MediaRecorder(stream, { mimeType: mime });
+      } catch {
+        mr = new MediaRecorder(stream);
+      }
+      mediaRecorderRef.current = mr;
+
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          chunksRef.current.push(e.data);
+          chunkTimestampsRef.current.push(Date.now());
+          pruneBuffer();
+        }
+      };
+      mr.onerror = () => showToast("Recording error — try restarting camera");
+
+      mr.start(1000);
+      setRecording(true);
+      setElapsed(0);
+      setBufferPct(0);
+      setBufferFull(false);
+      startingRef.current = false;
+
+      let sec = 0;
+      clearTimers();
+      elapsedTimerRef.current = setInterval(() => { sec++; setElapsed(sec); }, 1000);
+
+      let bPct = 0;
+      bufferTimerRef.current = setInterval(() => {
+        bPct = Math.min(100, bPct + 100 / BUFFER_SEC);
+        setBufferPct(bPct);
+        if (bPct >= 100) setBufferFull(true);
+      }, 1000);
+
+      // Wake lock
+      try { await navigator.wakeLock?.request("screen"); } catch {}
+
+    } catch (err) {
+      startingRef.current = false;
+      if (err.name === "NotAllowedError") {
+        showToast("⚠️ Camera permission denied — allow it in browser settings");
+      } else if (err.name === "NotFoundError") {
+        showToast("⚠️ No camera found on this device");
+      } else {
+        showToast("⚠️ Could not start camera: " + err.message);
+      }
+      setRecording(false);
+    }
+  }, [facingMode, pruneBuffer, showToast]);
+
+  const handleToggleCamera = useCallback(() => {
+    if (recording) {
+      stopEverything();
+    } else {
+      startCamera();
+    }
+  }, [recording, startCamera, stopEverything]);
+
+  const handleFlip = useCallback(async () => {
+    const newFacing = facingMode === "environment" ? "user" : "environment";
+    setFacingMode(newFacing);
+    stopEverything({ keepState: true });
+    setZoom(1); zoomRef.current = 1;
+    // Small delay so tracks fully stop
+    setTimeout(() => startCamera(newFacing), 300);
+  }, [facingMode, startCamera, stopEverything]);
+
+  // ── Pinch to zoom ─────────────────────────────────────────────────────────
+  const getDist = (touches) => {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  };
+
+  const handleTouchStart = (e) => {
+    if (e.touches.length === 2) lastDistRef.current = getDist(e.touches);
+  };
+
+  const handleTouchMove = (e) => {
+    if (e.touches.length !== 2 || lastDistRef.current === null) return;
+    const dist = getDist(e.touches);
+    const delta = dist / lastDistRef.current;
+    lastDistRef.current = dist;
+    const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoomRef.current * delta));
+    zoomRef.current = newZoom;
+    setZoom(newZoom);
+
+    // Native camera zoom via track constraints if supported
+    if (streamRef.current) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track) {
+        const caps = track.getCapabilities?.() || {};
+        if (caps.zoom) {
+          const zMin = caps.zoom.min ?? 1;
+          const zMax = caps.zoom.max ?? 4;
+          const z = zMin + (zMax - zMin) * ((newZoom - MIN_ZOOM) / (MAX_ZOOM - MIN_ZOOM));
+          track.applyConstraints({ advanced: [{ zoom: z }] }).catch(() => {});
+        }
+      }
+    }
+  };
+
+  const handleTouchEnd = (e) => {
+    if (e.touches.length < 2) lastDistRef.current = null;
+  };
+
+  // ── Capture ────────────────────────────────────────────────────────────────
+  const captureHighlight = useCallback(() => {
+    if (!mediaRecorderRef.current || !recording) {
+      showToast("Start the camera first!");
+      return;
+    }
+    playClickSound();
+    setCapturing(true);
+    setTimeout(() => setCapturing(false), 600);
+
+    try { mediaRecorderRef.current.requestData(); } catch {}
+
+    setTimeout(() => {
+      pruneBuffer();
+      if (!chunksRef.current.length) {
+        showToast("No footage yet — keep recording!");
+        return;
+      }
+      const mime = getSupportedMime();
+      const blob = new Blob(chunksRef.current, { type: mime });
+      setLastBlob(blob);
+      setClipSize((blob.size / 1048576).toFixed(1));
+      setModal("highlight");
+    }, 350);
+  }, [recording, pruneBuffer, showToast]);
+
+  // ── Save / Share ───────────────────────────────────────────────────────────
+  const doSave = useCallback(() => {
+    if (!lastBlob) return;
+    const ext = lastBlob.type.includes("mp4") ? "mp4" : "webm";
+    const url = URL.createObjectURL(lastBlob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `pickle-${Date.now()}.${ext}`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 6000);
+    setModal(null);
+    showToast("💾 Downloading to your device!");
+  }, [lastBlob, showToast]);
+
+  const doShare = useCallback(async () => {
+    if (!lastBlob) return;
+    const ext = lastBlob.type.includes("mp4") ? "mp4" : "webm";
+    const file = new File([lastBlob], `pickle-${Date.now()}.${ext}`, { type: lastBlob.type });
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: "🎯 Pickleball Highlight!", text: "Check out this play!" });
+        setModal(null); return;
+      } catch (err) { if (err.name === "AbortError") return; }
+    }
+    doSave();
+    showToast("📲 Share unavailable here — file downloaded instead!");
+  }, [lastBlob, doSave, showToast]);
+
+  const fmtTime = (s) => `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
+
+  // ── Styles ─────────────────────────────────────────────────────────────────
+  const S = {
+    root: {
+      minHeight: "100dvh", display: "flex", flexDirection: "column",
+      background: "#080d08", color: "#e8f5e8",
+      fontFamily: "'DM Sans', system-ui, sans-serif",
+      userSelect: "none", overflow: "hidden", position: "relative",
+      touchAction: "none",
+    },
+    header: {
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      padding: "12px 16px 10px", borderBottom: "1px solid #182218",
+      flexShrink: 0, background: "#080d08", zIndex: 10,
+    },
+    logo: { fontFamily: "'Bebas Neue', sans-serif", fontSize: 24, letterSpacing: 3, color: "#4ade80", lineHeight: 1 },
+    pill: {
+      display: "flex", alignItems: "center", gap: 6,
+      background: "#0f180f", border: "1px solid #182218", borderRadius: 99,
+      padding: "4px 11px", fontSize: 11, fontWeight: 600,
+    },
+    camWrap: {
+      flex: 1, position: "relative", background: "#030603",
+      overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center",
+      // portrait: fills width naturally; landscape: constrained height
+      minHeight: 0,
+    },
+    video: {
+      width: "100%", height: "100%", objectFit: "cover", display: "block",
+      transformOrigin: "center center",
+    },
+    controls: {
+      flexShrink: 0, background: "#080d08", borderTop: "1px solid #182218",
+      padding: "14px 16px 30px", display: "flex", flexDirection: "column", gap: 10,
+    },
+    bigBtn: (active, flash) => ({
+      width: "100%", height: 72, border: "none", borderRadius: 14,
+      cursor: active ? "pointer" : "not-allowed",
+      background: flash ? "#fff" : active
+        ? "linear-gradient(135deg,#15803d,#4ade80 50%,#facc15)"
+        : "#0f180f",
+      fontFamily: "'Bebas Neue', sans-serif", fontSize: 28, letterSpacing: 3,
+      color: flash ? "#080d08" : active ? "#080d08" : "#2a3a2a",
+      boxShadow: active ? "0 0 36px rgba(74,222,128,.35)" : "none",
+      border: active ? "none" : "1px solid #182218",
+      transition: "background .1s, box-shadow .2s, color .1s",
+      display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+    }),
+    secBtn: (active, disabled) => ({
+      background: "#0f180f",
+      border: `1px solid ${active ? "#4ade80" : "#182218"}`,
+      borderRadius: 12, padding: "10px 4px", cursor: disabled ? "not-allowed" : "pointer",
+      display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+      color: active ? "#4ade80" : disabled ? "#1e2e1e" : "#e8f5e8",
+      fontSize: 10, fontWeight: 600, fontFamily: "'DM Sans',sans-serif",
+      transition: "border-color .15s, color .15s",
+    }),
+  };
+
+  return (
+    <div style={S.root}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;600;700&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root { -webkit-tap-highlight-color: transparent; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+        @keyframes slideUp { from{transform:translateY(100%)} to{transform:translateY(0)} }
+        @keyframes scanline { 0%{top:-5%} 100%{top:105%} }
+        @keyframes flashRing { 0%{box-shadow:0 0 0 0 rgba(74,222,128,.8)} 100%{box-shadow:0 0 0 24px rgba(74,222,128,0)} }
+      `}</style>
+
+      {/* HEADER */}
+      <div style={S.header}>
+        <div style={S.logo}>Pickle<span style={{ color: "#facc15" }}>REEL</span></div>
+
+        {/* Zoom indicator */}
+        {recording && zoom > 1.05 && (
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#facc15", fontFamily: "'Bebas Neue',sans-serif", letterSpacing: 1 }}>
+            {zoom.toFixed(1)}×
+          </div>
+        )}
+
+        <div style={S.pill}>
+          <div style={{
+            width: 7, height: 7, borderRadius: "50%",
+            background: recording ? "#ef4444" : "#2a3a2a",
+            animation: recording ? "pulse 1.2s infinite" : "none",
+          }} />
+          <span style={{ color: recording ? (bufferFull ? "#4ade80" : "#e8f5e8") : "#3a5a3a" }}>
+            {recording ? (bufferFull ? "READY" : "BUFFERING…") : "STANDBY"}
+          </span>
+        </div>
+      </div>
+
+      {/* CAMERA */}
+      <div
+        ref={cameraWrapRef}
+        style={S.camWrap}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+      >
+        {/* Flash overlay on capture */}
+        {capturing && (
+          <div style={{ position: "absolute", inset: 0, background: "rgba(74,222,128,.22)", zIndex: 10, pointerEvents: "none" }} />
+        )}
+
+        <video
+          ref={videoRef}
+          autoPlay muted playsInline
+          style={{
+            ...S.video,
+            transform: `scaleX(${facingMode === "user" ? -1 : 1}) scale(${zoom})`,
+          }}
+        />
+
+        {/* Grid */}
+        {recording && (
+          <div style={{
+            position: "absolute", inset: 0, pointerEvents: "none",
+            backgroundImage: "linear-gradient(rgba(74,222,128,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(74,222,128,.04) 1px,transparent 1px)",
+            backgroundSize: "55px 55px",
+          }} />
+        )}
+
+        {/* Scanline */}
+        {recording && (
+          <div style={{
+            position: "absolute", left: 0, right: 0, height: 2, pointerEvents: "none",
+            background: "linear-gradient(90deg,transparent,rgba(74,222,128,.35),transparent)",
+            animation: "scanline 4s linear infinite",
+          }} />
+        )}
+
+        {/* Corner brackets */}
+        {recording && ["tl","tr","bl","br"].map(c => (
+          <div key={c} style={{
+            position: "absolute", width: 20, height: 20,
+            top: c[0]==="t" ? 12 : undefined, bottom: c[0]==="b" ? 12 : undefined,
+            left: c[1]==="l" ? 12 : undefined, right: c[1]==="r" ? 12 : undefined,
+            borderColor: "#4ade80", borderStyle: "solid", opacity: .55,
+            borderWidth: `${c[0]==="t"?"2px":"0"} ${c[1]==="r"?"2px":"0"} ${c[0]==="b"?"2px":"0"} ${c[1]==="l"?"2px":"0"}`,
+          }} />
+        ))}
+
+        {/* Rec timer */}
+        {recording && (
+          <div style={{
+            position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)",
+            background: "rgba(0,0,0,.6)", backdropFilter: "blur(8px)",
+            border: "1px solid rgba(239,68,68,.4)", borderRadius: 99,
+            padding: "4px 13px", fontSize: 12, fontWeight: 700, letterSpacing: 1,
+            display: "flex", alignItems: "center", gap: 5,
+          }}>
+            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#ef4444", animation: "pulse 1s infinite" }} />
+            {fmtTime(elapsed)}
+          </div>
+        )}
+
+        {/* Zoom hint */}
+        {recording && zoom <= 1.05 && (
+          <div style={{
+            position: "absolute", bottom: 12, right: 12,
+            background: "rgba(0,0,0,.5)", borderRadius: 8, padding: "4px 8px",
+            fontSize: 10, color: "rgba(255,255,255,.4)", pointerEvents: "none",
+          }}>
+            pinch to zoom
+          </div>
+        )}
+
+        {/* No camera placeholder */}
+        {!recording && (
+          <div style={{
+            position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center", gap: 14,
+            color: "#2a4a2a", textAlign: "center", padding: 28,
+          }}>
+            <div style={{ fontSize: 56 }}>🎾</div>
+            <p style={{ maxWidth: 210, lineHeight: 1.65, fontSize: 14 }}>
+              Tap <strong style={{ color: "#4ade80" }}>Start Cam</strong> — prop your phone on the court and play!
+            </p>
+          </div>
+        )}
+
+        {/* Buffer bar */}
+        <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 3, background: "rgba(255,255,255,.06)" }}>
+          <div style={{
+            height: "100%", width: bufferPct + "%",
+            background: "linear-gradient(90deg,#15803d,#4ade80,#facc15)",
+            transition: "width .9s linear",
+          }} />
+        </div>
+      </div>
+
+      {/* TIP */}
+      <div style={{ padding: "7px 18px", fontSize: 11, color: "#2a4a2a", textAlign: "center", flexShrink: 0, letterSpacing: .3 }}>
+        {bufferFull
+          ? "🟢 Buffer ready — hit SAVE HIGHLIGHT after a great shot!"
+          : recording ? `Building buffer… ${Math.round(bufferPct)}%` : "Pinch camera to zoom · Hit big button after every highlight"}
+      </div>
+
+      {/* CONTROLS */}
+      <div style={S.controls}>
+        <button onClick={captureHighlight} disabled={!recording} style={S.bigBtn(recording, capturing)}>
+          <span style={{ fontSize: 24 }}>🎯</span> SAVE HIGHLIGHT
+        </button>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 9 }}>
+          <button onClick={handleToggleCamera} style={S.secBtn(recording, false)}>
+            <span style={{ fontSize: 19 }}>{recording ? "⏹" : "📷"}</span>
+            {recording ? "Stop" : "Start Cam"}
+          </button>
+          <button onClick={handleFlip} disabled={!recording} style={S.secBtn(false, !recording)}>
+            <span style={{ fontSize: 19 }}>🔄</span>
+            Flip Cam
+          </button>
+          <button onClick={() => setModal("help")} style={S.secBtn(false, false)}>
+            <span style={{ fontSize: 19 }}>❓</span>
+            How To
+          </button>
+        </div>
+      </div>
+
+      {/* HIGHLIGHT MODAL */}
+      {modal === "highlight" && (
+        <div onClick={() => setModal(null)} style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,.88)", backdropFilter: "blur(6px)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 200,
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: "#0d160d", border: "1px solid #182218", borderRadius: "22px 22px 0 0",
+            width: "100%", maxWidth: 480, padding: "26px 20px 38px",
+            display: "flex", flexDirection: "column", gap: 13,
+            animation: "slideUp .28s ease",
+          }}>
+            <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 26, letterSpacing: 2, color: "#4ade80" }}>
+              🎯 Highlight Captured!
+            </div>
+            <div style={{ fontSize: 11, color: "#2a5a2a", marginTop: -6 }}>
+              ~{Math.min(BUFFER_SEC, elapsed)}s · {clipSize} MB
+            </div>
+
+            {[
+              { icon: "💾", title: "Save to Phone", desc: "Download to your files / camera roll", fn: doSave },
+              { icon: "📤", title: "Share / Text / Email", desc: "Opens your share sheet — Messages, WhatsApp, Gmail…", fn: doShare },
+            ].map(b => (
+              <button key={b.title} onClick={b.fn} style={{
+                display: "flex", alignItems: "center", gap: 13,
+                background: "#080d08", border: "1px solid #182218", borderRadius: 13,
+                padding: "14px 15px", cursor: "pointer", color: "#e8f5e8",
+                fontFamily: "'DM Sans',sans-serif", fontSize: 14, fontWeight: 600,
+                textAlign: "left", width: "100%",
+              }}>
+                <span style={{ fontSize: 24, flexShrink: 0 }}>{b.icon}</span>
+                <div>
+                  <div>{b.title}</div>
+                  <div style={{ fontSize: 11, color: "#2a5a2a", marginTop: 2, fontWeight: 400 }}>{b.desc}</div>
+                </div>
+              </button>
+            ))}
+
+            <button onClick={() => setModal(null)} style={{
+              background: "transparent", border: "1px solid #182218", borderRadius: 11,
+              padding: 12, color: "#2a5a2a", fontFamily: "'DM Sans',sans-serif",
+              fontSize: 12, cursor: "pointer",
+            }}>
+              Keep Recording — Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* HELP MODAL */}
+      {modal === "help" && (
+        <div onClick={() => setModal(null)} style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,.88)", backdropFilter: "blur(6px)",
+          display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 200,
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: "#0d160d", border: "1px solid #182218", borderRadius: "22px 22px 0 0",
+            width: "100%", maxWidth: 480, padding: "26px 20px 38px",
+            display: "flex", flexDirection: "column", gap: 13,
+            animation: "slideUp .28s ease",
+          }}>
+            <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 24, letterSpacing: 2, color: "#4ade80" }}>📖 How To Use</div>
+            {[
+              ["1️⃣", "Tap Start Cam", "Allows camera & mic. A 30-second rolling buffer starts building."],
+              ["2️⃣", "Prop phone on court", "Face the camera toward the action. Landscape or portrait both work."],
+              ["3️⃣", "Pinch screen to zoom", "Use two fingers to zoom in on the court — up to 4×."],
+              ["4️⃣", "Hit SAVE HIGHLIGHT", "Tap immediately after a great shot. You'll hear a click + see a flash."],
+              ["5️⃣", "Save or Share", "Download to phone or send via text, email, WhatsApp, etc."],
+            ].map(([n, t, d]) => (
+              <div key={t} style={{ display: "flex", gap: 11 }}>
+                <span style={{ fontSize: 18, flexShrink: 0 }}>{n}</span>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{t}</div>
+                  <div style={{ fontSize: 11, color: "#2a5a2a", lineHeight: 1.55 }}>{d}</div>
+                </div>
+              </div>
+            ))}
+            <div style={{ background: "#080d08", border: "1px solid #182218", borderRadius: 10, padding: 12, fontSize: 11, color: "#2a5a2a", lineHeight: 1.6 }}>
+              💡 Disable auto-lock in phone settings so screen stays on. Plug in for long sessions.
+            </div>
+            <button onClick={() => setModal(null)} style={{
+              background: "linear-gradient(135deg,#15803d,#4ade80)", border: "none", borderRadius: 12,
+              padding: 13, color: "#080d08", fontFamily: "'Bebas Neue',sans-serif",
+              fontSize: 20, letterSpacing: 2, cursor: "pointer",
+            }}>
+              GOT IT — LET'S PLAY 🎾
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* TOAST */}
+      <div style={{
+        position: "fixed", bottom: 106, left: "50%",
+        transform: `translateX(-50%) translateY(${toastVisible ? 0 : 10}px)`,
+        opacity: toastVisible ? 1 : 0,
+        transition: "opacity .28s, transform .28s",
+        background: "rgba(13,22,13,.96)", border: "1px solid #4ade80",
+        borderRadius: 11, padding: "10px 16px", fontSize: 13, fontWeight: 600,
+        color: "#4ade80", zIndex: 300, pointerEvents: "none",
+        maxWidth: "88vw", textAlign: "center", lineHeight: 1.45,
+      }}>
+        {toast}
+      </div>
+    </div>
+  );
+}
